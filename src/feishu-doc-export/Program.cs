@@ -6,7 +6,9 @@ using feishu_doc_export.Dtos;
 using feishu_doc_export.Helper;
 using feishu_doc_export.HttpApi;
 using Microsoft.Extensions.DependencyInjection;
+using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Threading;
 using WebApiClientCore;
 using WebApiClientCore.Exceptions;
 
@@ -124,7 +126,13 @@ namespace feishu_doc_export
 
                     try
                     {
-                        await DownLoadDocument(fileExtension, item.Token, item.Type);
+                        var metadata = new Dictionary<string, string>
+                        {
+                            { "created_time", item.CreatedTime },
+                            { "modified_time", item.ModifiedTime },
+                            { "owner_id", item.OwnerId }
+                        };
+                        await DownLoadDocument(fileExtension, item.Token, item.Type, metadata);
                     }
                     catch (HttpRequestException ex)
                     {
@@ -183,90 +191,137 @@ namespace feishu_doc_export
                 DocumentPathGenerator.GenerateDocumentPaths(wikiNodes, GlobalConfig.ExportPath);
 
                 // 记录导出的文档数量
-                int count = 1;
+                int count = 0;
+                using var semaphore = new SemaphoreSlim(10); // 增加并发数到10
+                var tasks = new List<Task>();
+                var listLock = new object();
+
                 foreach (var item in wikiNodes)
                 {
-
-                    var isSupport = GlobalConfig.GetFileExtension(item.ObjType, out string fileExt);
-
-                    // 如果该文件类型不支持导出
-                    if (!isSupport)
+                    tasks.Add(Task.Run(async () =>
                     {
-                        noSupportExportFiles.Add(item.Title);
-                        LogHelper.LogWarn($"文档【{item.Title}】不支持导出，已忽略。如有需要请手动下载。");
-                        continue;
-                    }
-
-                    // 文档为文件类型则直接下载文件
-                    if (fileExt == "file")
-                    {
+                        await semaphore.WaitAsync();
                         try
                         {
-                            Console.WriteLine($"正在导出文档————————{count++}.【{item.Title}】");
+                            var isSupport = GlobalConfig.GetFileExtension(item.ObjType, out string fileExt);
 
-                            await DownLoadFile(item.ObjToken);
+                            // 如果该文件类型不支持导出
+                            if (!isSupport)
+                            {
+                                lock (listLock)
+                                {
+                                    noSupportExportFiles.Add(item.Title);
+                                }
+                                LogHelper.LogWarn($"文档【{item.Title}】不支持导出，已忽略。如有需要请手动下载。");
+                                return;
+                            }
 
-                            continue;
+                            // 准备元数据
+                            var metadata = new Dictionary<string, string>
+                            {
+                                { "CreatedTime", item.ObjCreateTime }, // 飞书返回的时间戳
+                                { "ModifiedTime", item.ObjEditTime },
+                                { "Creator", item.Creator },
+                                { "Owner", item.Owner }
+                            };
+
+                            // 文档为文件类型则直接下载文件
+                            if (fileExt == "file")
+                            {
+                                try
+                                {
+                                    var currentCount = Interlocked.Increment(ref count);
+                                    Console.WriteLine($"正在导出文档————————{currentCount}.【{item.Title}】\n  - 创建时间: {item.ObjCreateTime}\n  - 修改时间: {item.ObjEditTime}\n  - 创建者ID: {item.Creator}");
+
+                                    await DownLoadFile(item.ObjToken);
+
+                                    return;
+                                }
+                                catch (HttpRequestException ex)
+                                {
+                                    lock (listLock)
+                                    {
+                                        noSupportExportFiles.Add(item.Title);
+                                    }
+                                    LogHelper.LogError($"下载文档【{item.Title}】时出现请求异常！！！异常信息：{ex.Message}，堆栈信息：{ex.StackTrace}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    lock (listLock)
+                                    {
+                                        noSupportExportFiles.Add(item.Title);
+                                    }
+                                    LogHelper.LogWarn($"下载文档【{item.Title}】时出现未知异常，已忽略。请手动下载。异常信息：{ex.Message}");
+                                }
+                            }
+
+                            // 用于展示的文件后缀名称
+                            var showFileExt = fileExt;
+                            // 用于指定文件下载类型
+                            var fileExtension = fileExt;
+
+                            // 只有当飞书文档类型为docx时才支持使用自定义文档保存类型
+                            if (fileExt == "docx")
+                            {
+                                showFileExt = GlobalConfig.DocSaveType;
+
+                                if (GlobalConfig.DocSaveType == "pdf")
+                                {
+                                    fileExtension = GlobalConfig.DocSaveType;
+                                }
+                            }
+
+                            // 文件名超出长度限制，不支持导出
+                            if (item.Title.Length > 64)
+                            {
+                                var left64FileName = item.Title.PadLeft(61) + $"···.{fileExt}";
+                                lock (listLock)
+                                {
+                                    noSupportExportFiles.Add($"(文件名超长){left64FileName}");
+                                }
+                                Console.WriteLine($"文档【{left64FileName}】的文件命名长度超出系统文件命名的长度限制，已忽略");
+                                return;
+                            }
+
+                            var currentCount2 = Interlocked.Increment(ref count);
+                            Console.WriteLine($"正在导出文档————————{currentCount2}.【{item.Title}.{showFileExt}】\n  - 创建时间: {item.ObjCreateTime}\n  - 修改时间: {item.ObjEditTime}\n  - 创建者ID: {item.Creator}");
+
+                            try
+                            {
+                                await DownLoadDocument(fileExtension, item.ObjToken, item.ObjType, metadata);
+                            }
+                            catch (HttpRequestException ex)
+                            {
+                                lock (listLock)
+                                {
+                                    noSupportExportFiles.Add(item.Title);
+                                }
+                                LogHelper.LogError($"下载文档【{item.Title}】时出现请求异常！！！异常信息：{ex.Message}，堆栈信息：{ex.StackTrace}");
+                            }
+                            catch (CustomException ex)
+                            {
+                                lock (listLock)
+                                {
+                                    noSupportExportFiles.Add(item.Title);
+                                }
+                                LogHelper.LogWarn($"文档【{item.Title}】{ex.Message}");
+                            }
+                            catch (Exception ex)
+                            {
+                                lock (listLock)
+                                {
+                                    noSupportExportFiles.Add(item.Title);
+                                }
+                                LogHelper.LogError($"下载文档【{item.Title}】时出现未知异常，已忽略，请手动下载。异常信息：{ex.Message}，堆栈信息：{ex.StackTrace}");
+                            }
                         }
-                        catch (HttpRequestException ex)
+                        finally
                         {
-                            noSupportExportFiles.Add(item.Title);
-                            LogHelper.LogError($"下载文档【{item.Title}】时出现请求异常！！！异常信息：{ex.Message}，堆栈信息：{ex.StackTrace}");
+                            semaphore.Release();
                         }
-                        catch (Exception ex)
-                        {
-                            noSupportExportFiles.Add(item.Title);
-                            LogHelper.LogWarn($"下载文档【{item.Title}】时出现未知异常，已忽略。请手动下载。异常信息：{ex.Message}");
-                        }
-                    }
-
-                    // 用于展示的文件后缀名称
-                    var showFileExt = fileExt;
-                    // 用于指定文件下载类型
-                    var fileExtension = fileExt;
-
-                    // 只有当飞书文档类型为docx时才支持使用自定义文档保存类型
-                    if (fileExt == "docx")
-                    {
-                        showFileExt = GlobalConfig.DocSaveType;
-
-                        if (GlobalConfig.DocSaveType == "pdf")
-                        {
-                            fileExtension = GlobalConfig.DocSaveType;
-                        }
-                    }
-
-                    // 文件名超出长度限制，不支持导出
-                    if (item.Title.Length > 64)
-                    {
-                        var left64FileName = item.Title.PadLeft(61) + $"···.{fileExt}";
-                        noSupportExportFiles.Add($"(文件名超长){left64FileName}");
-                        Console.WriteLine($"文档【{left64FileName}】的文件命名长度超出系统文件命名的长度限制，已忽略");
-                        continue;
-                    }
-
-                    Console.WriteLine($"正在导出文档————————{count++}.【{item.Title}.{showFileExt}】");
-
-                    try
-                    {
-                        await DownLoadDocument(fileExtension, item.ObjToken, item.ObjType);
-                    }
-                    catch (HttpRequestException ex)
-                    {
-                        noSupportExportFiles.Add(item.Title);
-                        LogHelper.LogError($"下载文档【{item.Title}】时出现请求异常！！！异常信息：{ex.Message}，堆栈信息：{ex.StackTrace}");
-                    }
-                    catch (CustomException ex)
-                    {
-                        noSupportExportFiles.Add(item.Title);
-                        LogHelper.LogWarn($"文档【{item.Title}】{ex.Message}");
-                    }
-                    catch (Exception ex)
-                    {
-                        noSupportExportFiles.Add(item.Title);
-                        LogHelper.LogError($"下载文档【{item.Title}】时出现未知异常，已忽略，请手动下载。异常信息：{ex.Message}，堆栈信息：{ex.StackTrace}");
-                    }
+                    }));
                 }
+                await Task.WhenAll(tasks);
             }
 
             
